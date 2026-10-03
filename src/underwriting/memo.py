@@ -1,0 +1,94 @@
+"""Credit memo. All numbers come from code/ML. The LLM (optional, Groq) only writes the commentary,
+and its output is rejected if it contains numbers that are not in the supplied facts."""
+import json
+import os
+import re
+
+import httpx
+
+ICON = {"PASS": "PASS", "WARN": "REVIEW", "FAIL": "FAIL"}
+
+
+def _facts(s: dict) -> dict:
+    x, m = s["extracted"]["fields"], s["metrics"]
+    return {
+        "recommendation": s["recommendation"], "probability_of_default": f"{s['credit']['pd']:.1%}",
+        "dti_post_loan": f"{m['dti_post']:.1%}", "verified_income": f"{m['verified_income']:,.0f}",
+        "new_emi": f"{m['new_emi']:,.0f}", "credit_score": f"{x['credit_score']:.0f}",
+        "failed_checks": [c["check"] for c in s["checks"] if c["status"] == "FAIL"],
+        "review_checks": [c["check"] for c in s["checks"] if c["status"] == "WARN"],
+        "fraud_flags": [f["detail"] for f in s["fraud"]["flags"]],
+        "top_risk_drivers": [f"{f['feature']} ({f['effect']})" for f in s["credit"]["top_factors"]],
+    }
+
+
+def _template(f: dict) -> str:
+    parts = [f"Recommendation: {f['recommendation']}. "
+             f"Estimated probability of default is {f['probability_of_default']} with post-loan DTI of {f['dti_post_loan']}."]
+    if f["fraud_flags"]:
+        parts.append("Document inconsistencies were found: " + "; ".join(f["fraud_flags"]) + ".")
+    if f["failed_checks"]:
+        parts.append("Policy failures: " + ", ".join(f["failed_checks"]) + ".")
+    if f["review_checks"]:
+        parts.append("Items needing underwriter judgement: " + ", ".join(f["review_checks"]) + ".")
+    if f["top_risk_drivers"]:
+        parts.append("Main model drivers: " + ", ".join(f["top_risk_drivers"]) + ".")
+    return " ".join(parts)
+
+
+def _numbers(text: str) -> set:
+    return {n.replace(",", "") for n in re.findall(r"\d[\d,]*\.?\d*", text)}
+
+
+def commentary(facts: dict) -> tuple[str, str]:
+    """Returns (text, source) where source is 'llm' or 'template'."""
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
+        return _template(facts), "template"
+    prompt = ("You are a credit analyst assistant. Write 3-4 sentences of commentary for a loan underwriter "
+              "using ONLY these facts. Do not compute or invent any number. Do not make the final decision.\n"
+              + json.dumps(facts))
+    try:
+        r = httpx.post("https://api.groq.com/openai/v1/chat/completions", timeout=30,
+                       headers={"Authorization": f"Bearer {key}"},
+                       json={"model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"), "temperature": 0.2,
+                             "messages": [{"role": "user", "content": prompt}]})
+        text = r.json()["choices"][0]["message"]["content"].strip()
+        allowed = _numbers(json.dumps(facts))
+        if _numbers(text) - allowed:  # numeric guard
+            return _template(facts), "template (llm rejected: unsupported numbers)"
+        return text, "llm"
+    except Exception:
+        return _template(facts), "template (llm unavailable)"
+
+
+def build_memo(s: dict) -> str:
+    x, m, c = s["extracted"]["fields"], s["metrics"], s["credit"]
+    facts = _facts(s)
+    text, src = commentary(facts)
+    L = [f"# Credit Memo - {x.get('application_id')}", "",
+         f"**Applicant:** {x['name']}, age {x['age']:.0f} | **Employer:** {x.get('employer')} | **Purpose:** {x.get('purpose')}",
+         f"**Request:** INR {x['loan_amount']:,.0f} over {x['tenure_months']} months at {x['interest_rate']}%",
+         "", f"## Recommendation: {s['recommendation']}", "",
+         "## Key figures (computed, not LLM)", "",
+         "| Metric | Value |", "|---|---|",
+         f"| Verified monthly income | INR {m['verified_income']:,.0f} |",
+         f"| New EMI | INR {m['new_emi']:,.0f} |",
+         f"| Existing EMIs | INR {m['existing_emi']:,.0f} |",
+         f"| DTI before / after loan | {m['dti_current']:.1%} / {m['dti_post']:.1%} |",
+         f"| Loan to monthly income | {m['loan_to_monthly_income']:.1f}x |",
+         f"| Monthly surplus after EMI and spend | INR {m['monthly_surplus_after_emi']:,.0f} |",
+         f"| Credit score | {x['credit_score']:.0f} |",
+         f"| Probability of default | {c['pd']:.1%} |", "",
+         "## Policy checks (with clause citations)", "",
+         "| Result | Check | Value | Rule | Clause |", "|---|---|---|---|---|"]
+    for k in s["checks"]:
+        L.append(f"| {ICON[k['status']]} | {k['check']} | {k['value']} | {k['threshold']} | {k['clause']} |")
+    L += ["", "## Model drivers (SHAP)", ""]
+    L += [f"- {f['feature']} = {f['value']}: {f['effect']} ({f['shap']:+.2f} log-odds)" for f in c["top_factors"]] or ["- n/a"]
+    L += ["", "## Fraud / consistency flags", ""]
+    L += [f"- [{f['clause']}] {f['detail']}" for f in s["fraud"]["flags"]] or ["- none"]
+    L += ["", f"## Analyst commentary ({src})", "", text, "",
+          "_Automated recommendation only. Final decision requires human underwriter approval (P-7.2)._",
+          "", "_Generated by Autonomous Loan Underwriting Agent · built by Sujit · github.com/sujit428755_"]
+    return "\n".join(L)
